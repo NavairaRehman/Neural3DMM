@@ -1,20 +1,48 @@
 
-### Code obtained and modified from https://github.com/anuragranj/coma, Copyright (c) 2018 Anurag Ranjan, Timo Bolkart, Soubhik Sanyal, Michael J. Black and the Max Planck Gesellschaft
-
 import math
 import heapq
-import numpy as np
 import os
-import scipy.sparse as sp
+import numpy as np
 from scipy import spatial
-try:
-    import psbody.mesh
-    found = True
-except ImportError:
-    found = False
-if found:
-    from psbody.mesh import Mesh
-#from psbody.mesh.topology.decimation import vertex_quadrics
+import scipy.sparse as sp
+from psbody.mesh import Mesh
+
+def row(A):
+    return A.reshape((1, -1))
+
+def col(A):
+    return A.reshape((-1, 1))
+
+def get_vert_connectivity(mesh_v, mesh_f):
+    """Returns a sparse matrix (of size #verts x #verts) where each nonzero
+    element indicates a neighborhood relation. For example, if there is a
+    nonzero element in position (15,12), that means vertex 15 is connected
+    by an edge to vertex 12."""
+
+    vpv = sp.csc_matrix((len(mesh_v),len(mesh_v)))
+
+    # for each column in the faces...
+    for i in range(3):
+        IS = mesh_f[:,i]
+        JS = mesh_f[:,(i+1)%3]
+        data = np.ones(len(IS))
+        ij = np.vstack((row(IS.flatten()), row(JS.flatten())))
+        mtx = sp.csc_matrix((data, ij), shape=vpv.shape)
+        vpv = vpv + mtx + mtx.T
+
+    return vpv
+
+def get_vertices_per_edge(mesh_v, mesh_f):
+    """Returns an Ex2 array of adjacencies between vertices, where
+    each element in the array is a vertex index. Each edge is included
+    only once. If output of get_faces_per_edge is provided, this is used to
+    avoid call to get_vert_connectivity()"""
+
+    vc = sp.coo_matrix(get_vert_connectivity(mesh_v, mesh_f))
+    result = np.hstack((col(vc.row), col(vc.col)))
+    result = result[result[:,0] < result[:,1]] # for uniqueness
+
+    return result
 
 
 def vertex_quadrics(mesh):
@@ -44,59 +72,22 @@ def vertex_quadrics(mesh):
 
     return v_quadrics
 
-def setup_deformation_transfer(source, target, use_normals=False):
-    rows = np.zeros(3 * target.v.shape[0])
-    cols = np.zeros(3 * target.v.shape[0])
-    coeffs_v = np.zeros(3 * target.v.shape[0])
-    coeffs_n = np.zeros(3 * target.v.shape[0])
+def _get_sparse_transform(faces, num_original_verts):
+    verts_left = np.unique(faces.flatten())
+    IS = np.arange(len(verts_left))
+    JS = verts_left
+    data = np.ones(len(JS))
 
-    nearest_faces, nearest_parts, nearest_vertices = source.compute_aabb_tree().nearest(target.v, True)
-    nearest_faces = nearest_faces.ravel().astype(np.int64)
-    nearest_parts = nearest_parts.ravel().astype(np.int64)
-    nearest_vertices = nearest_vertices.ravel()
+    mp = np.arange(0, np.max(faces.flatten()) + 1)
+    mp[JS] = IS
+    new_faces = mp[faces.copy().flatten()].reshape((-1, 3))
 
-    for i in range(target.v.shape[0]):
-        # Closest triangle index
-        f_id = nearest_faces[i]
-        # Closest triangle vertex ids
-        nearest_f = source.f[f_id]
+    ij = np.vstack((IS.flatten(), JS.flatten()))
+    mtx = sp.csc_matrix((data, ij), shape=(len(verts_left) , num_original_verts ))
 
-        # Closest surface point
-        nearest_v = nearest_vertices[3 * i:3 * i + 3]
-        # Distance vector to the closest surface point
-        dist_vec = target.v[i] - nearest_v
-
-        rows[3 * i:3 * i + 3] = i * np.ones(3)
-        cols[3 * i:3 * i + 3] = nearest_f
-
-        n_id = nearest_parts[i]
-        if n_id == 0:
-            # Closest surface point in triangle
-            A = np.vstack((source.v[nearest_f])).T
-            coeffs_v[3 * i:3 * i + 3] = np.linalg.lstsq(A, nearest_v)[0]
-        elif n_id > 0 and n_id <= 3:
-            # Closest surface point on edge
-            A = np.vstack((source.v[nearest_f[n_id - 1]], source.v[nearest_f[n_id % 3]])).T
-            tmp_coeffs = np.linalg.lstsq(A, target.v[i])[0]
-            coeffs_v[3 * i + n_id - 1] = tmp_coeffs[0]
-            coeffs_v[3 * i + n_id % 3] = tmp_coeffs[1]
-        else:
-            # Closest surface point a vertex
-            coeffs_v[3 * i + n_id - 4] = 1.0
-
-    #    if use_normals:
-    #        A = np.vstack((vn[nearest_f])).T
-    #        coeffs_n[3 * i:3 * i + 3] = np.linalg.lstsq(A, dist_vec)[0]
-
-    #coeffs = np.hstack((coeffs_v, coeffs_n))
-    #rows = np.hstack((rows, rows))
-    #cols = np.hstack((cols, source.v.shape[0] + cols))
-    matrix = sp.csc_matrix((coeffs_v, (rows, cols)), shape=(target.v.shape[0], source.v.shape[0]))
-    return matrix
-
+    return (new_faces, mtx)
 
 def qslim_decimator_transformer(mesh, factor=None, n_verts_desired=None):
-    from opendr.topology import get_vertices_per_edge
     """Return a simplified version of this mesh.
 
     A Qslim-style approach is used here.
@@ -211,27 +202,61 @@ def qslim_decimator_transformer(mesh, factor=None, n_verts_desired=None):
     return new_faces, mtx
 
 
-def _get_sparse_transform(faces, num_original_verts):
-    verts_left = np.unique(faces.flatten())
-    IS = np.arange(len(verts_left))
-    JS = verts_left
-    data = np.ones(len(JS))
+def setup_deformation_transfer(source, target, use_normals=False):
+    rows = np.zeros(3 * target.v.shape[0])
+    cols = np.zeros(3 * target.v.shape[0])
+    coeffs_v = np.zeros(3 * target.v.shape[0])
+    coeffs_n = np.zeros(3 * target.v.shape[0])
 
-    mp = np.arange(0, np.max(faces.flatten()) + 1)
-    mp[JS] = IS
-    new_faces = mp[faces.copy().flatten()].reshape((-1, 3))
+    nearest_faces, nearest_parts, nearest_vertices = source.compute_aabb_tree().nearest(target.v, True)
+    nearest_faces = nearest_faces.ravel().astype(np.int64)
+    nearest_parts = nearest_parts.ravel().astype(np.int64)
+    nearest_vertices = nearest_vertices.ravel()
 
-    ij = np.vstack((IS.flatten(), JS.flatten()))
-    mtx = sp.csc_matrix((data, ij), shape=(len(verts_left) , num_original_verts ))
+    for i in range(target.v.shape[0]):
+        # Closest triangle index
+        f_id = nearest_faces[i]
+        # Closest triangle vertex ids
+        nearest_f = source.f[f_id]
 
-    return (new_faces, mtx)
+        # Closest surface point
+        nearest_v = nearest_vertices[3 * i:3 * i + 3]
+        # Distance vector to the closest surface point
+        dist_vec = target.v[i] - nearest_v
+
+        rows[3 * i:3 * i + 3] = i * np.ones(3)
+        cols[3 * i:3 * i + 3] = nearest_f
+
+        n_id = nearest_parts[i]
+        if n_id == 0:
+            # Closest surface point in triangle
+            A = np.vstack((source.v[nearest_f])).T
+            coeffs_v[3 * i:3 * i + 3] = np.linalg.lstsq(A, nearest_v)[0]
+        elif n_id > 0 and n_id <= 3:
+            # Closest surface point on edge
+            A = np.vstack((source.v[nearest_f[n_id - 1]], source.v[nearest_f[n_id % 3]])).T
+            tmp_coeffs = np.linalg.lstsq(A, target.v[i])[0]
+            coeffs_v[3 * i + n_id - 1] = tmp_coeffs[0]
+            coeffs_v[3 * i + n_id % 3] = tmp_coeffs[1]
+        else:
+            # Closest surface point a vertex
+            coeffs_v[3 * i + n_id - 4] = 1.0
+
+    #    if use_normals:
+    #        A = np.vstack((vn[nearest_f])).T
+    #        coeffs_n[3 * i:3 * i + 3] = np.linalg.lstsq(A, dist_vec)[0]
+
+    #coeffs = np.hstack((coeffs_v, coeffs_n))
+    #rows = np.hstack((rows, rows))
+    #cols = np.hstack((cols, source.v.shape[0] + cols))
+    matrix = sp.csc_matrix((coeffs_v, (rows, cols)), shape=(target.v.shape[0], source.v.shape[0]))
+    return matrix
+
 
 def generate_transform_matrices(mesh, factors):
-    
-    from opendr.topology import get_vert_connectivity
     """Generates len(factors) meshes, each of them is scaled by factors[i] and
        computes the transformations between them.
-    
+
     Returns:
        M: a set of meshes downsampled from mesh by a factor specified in factors.
        A: Adjacency matrix for each of the meshes
@@ -239,34 +264,28 @@ def generate_transform_matrices(mesh, factors):
        U: Upsampling transforms between each of the meshes
     """
 
-    factors = map(lambda x: 1.0/x, factors)
-    M,A,D,U = [], [], [], []
-    ## sergey code
-    F = []
-    ##
-    A.append(get_vert_connectivity(mesh.v, mesh.f))
+    factors = map(lambda x: 1.0 / x, factors)
+    M, A, D, U = [], [], [], []
+    A.append(get_vert_connectivity(mesh.v, mesh.f).tocoo())
     M.append(mesh)
 
-    i = 0 
-    for factor in factors:
+    ## sergey code
+    F = []
+
+    for i,factor in enumerate(factors):
         ds_f, ds_D = qslim_decimator_transformer(M[-1], factor=factor)
         D.append(ds_D)
-        ##
         F.append(ds_f)
-        ##
-        new_mesh_v = ds_D.dot(M[-1].v)     
-        new_mesh = Mesh(v=new_mesh_v,f=ds_f)
+        new_mesh_v = ds_D.dot(M[-1].v)
+        new_mesh = Mesh(v=new_mesh_v, f=ds_f)
         M.append(new_mesh)
-        A.append(get_vert_connectivity(new_mesh.v, new_mesh.f))
-        U.append(setup_deformation_transfer(M[-1], M[-2]))
-        print('decimation %d by factor %.2f finished' %(i,factor))
-        i+=1
+        A.append(get_vert_connectivity(new_mesh.v, new_mesh.f).tocoo())
+        U.append(setup_deformation_transfer(M[-1], M[-2]).tocoo())
 
-    return M,A,D,U, F
+    return M, A, D, U, F
 
 def generate_transform_matrices_given_downsamples(mesh, downsample_directory, num_downsamples=4):
     
-    from opendr.topology import get_vert_connectivity
     M,A,D,U,F = [],[],[],[],[]
     A.append(get_vert_connectivity(mesh.v,mesh.f))
     M.append(mesh)
